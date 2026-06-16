@@ -4,6 +4,7 @@ import {
   CreateStayRuleDto,
   UpdateStayRuleDto,
   QueryStayRuleDto,
+  SimulateRuleDto,
 } from '../dto/stay-rule.dto';
 import { PaginationDto, ApiResponseDto } from '../../../common/dto/common.dto';
 import { ContextHelper } from '../../../common/middleware/context.middleware';
@@ -49,5 +50,16 @@ export class StayRuleController {
   async update(@Param('id') id: string, @Body() dto: UpdateStayRuleDto, @Req() req: any) {
     const data = await this.stayRuleService.updateRule(id, dto, ContextHelper.get(req));
     return ApiResponseDto.success(data, '规则更新成功');
+  }
+
+  @Post('simulate')
+  async simulate(@Body() dto: SimulateRuleDto) {
+    const data = await this.stayRuleService.simulateMatch(
+      dto.hospitalId,
+      dto.areaId,
+      new Date(dto.startTime),
+      dto.durationSeconds,
+    );
+    return ApiResponseDto.success(data);
   }
 }

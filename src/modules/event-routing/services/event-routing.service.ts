@@ -367,11 +367,7 @@ export class EventRoutingService {
           ? Math.round((new Date(record.endTime).getTime() - new Date(record.startTime).getTime()) / 1000)
           : Math.round((Date.now() - new Date(record.startTime).getTime()) / 1000);
 
-      if (actualDuration < matchedRule.maxStaySeconds) {
-        record.isProcessed = true;
-        await this.stayRecordRepo.save(record);
-        continue;
-      }
+      const durationExceeded = actualDuration >= matchedRule.maxStaySeconds;
 
       if (matchedRule.mergeSamePerson && currentEvent) {
         const lastDetected = new Date(currentEvent.lastDetectedAt);
@@ -379,7 +375,7 @@ export class EventRoutingService {
         const timeDiff = Math.round((recordStart.getTime() - lastDetected.getTime()) / 1000);
 
         if (timeDiff <= matchedRule.mergeTimeWindowSeconds) {
-          await this.mergeRecordIntoEvent(currentEvent, record, actualDuration);
+          await this.mergeRecordIntoEvent(currentEvent, record, actualDuration, matchedRule);
           record.isMerged = true;
           record.mergedIntoEventId = currentEvent.id;
           record.isProcessed = true;
@@ -387,6 +383,12 @@ export class EventRoutingService {
           merged++;
           continue;
         }
+      }
+
+      if (!durationExceeded) {
+        record.isProcessed = true;
+        await this.stayRecordRepo.save(record);
+        continue;
       }
 
       currentEvent = await this.createEventFromRecord(record, person, matchedRule, actualDuration);
@@ -404,7 +406,9 @@ export class EventRoutingService {
     event: SecurityEvent,
     record: PersonStayRecord,
     duration: number,
+    matchedRule?: any,
   ): Promise<void> {
+    const area = await this.areaRepo.findOneBy({ id: record.areaId }) as Area;
     const areaSet = new Set(event.involvedAreaIds);
     areaSet.add(record.areaId);
     event.involvedAreaIds = Array.from(areaSet);
@@ -431,6 +435,27 @@ export class EventRoutingService {
       event.snapshots = [...event.snapshots, ...record.snapshots].slice(-10);
     }
 
+    const extra = (event.extraData as any) || {};
+    if (extra.analysisSummary) {
+      extra.analysisSummary.mergedSegments = extra.analysisSummary.mergedSegments || [];
+      extra.analysisSummary.mergedSegments.push({
+        recordId: record.id,
+        areaId: record.areaId,
+        areaName: area?.name,
+        deviceId: record.deviceId,
+        startTime: record.startTime,
+        endTime: record.endTime || new Date(),
+        durationSeconds: duration,
+        isTriggerSegment: false,
+        thresholdAtTime: matchedRule?.maxStaySeconds,
+        mergedAt: new Date(),
+      });
+      extra.analysisSummary.threshold.actualDurationSeconds = event.totalDurationSeconds;
+      extra.analysisSummary.threshold.exceededBySeconds = event.totalDurationSeconds - extra.analysisSummary.threshold.effectiveMaxStaySeconds;
+      extra.analysisSummary.updatedAt = new Date();
+      event.extraData = extra as any;
+    }
+
     await this.eventRepo.save(event);
 
     this.eventEmitter.emit('event.merged', {
@@ -452,6 +477,23 @@ export class EventRoutingService {
     const title = person
       ? `人员 ${person.name} 在${sceneName}区域异常滞留 ${Math.round(duration / 60)} 分钟`
       : `检测到${sceneName}区域异常滞留 ${Math.round(duration / 60)} 分钟`;
+
+    const analysisSummary = this.buildAnalysisSummary(
+      matchedRule,
+      record.startTime,
+      duration,
+      [{
+        recordId: record.id,
+        areaId: record.areaId,
+        areaName: area?.name,
+        deviceId: record.deviceId,
+        startTime: record.startTime,
+        endTime: record.endTime || new Date(),
+        durationSeconds: duration,
+        isTriggerSegment: true,
+        thresholdAtTime: matchedRule.maxStaySeconds,
+      }],
+    );
 
     const dto: CreateEventDto = {
       hospitalId: record.hospitalId,
@@ -480,7 +522,127 @@ export class EventRoutingService {
       strictModeTriggered: matchedRule.isStrictModeApplied,
     };
 
-    return this.createEvent(dto, { userId: 'system', userName: '系统', userRole: 'system' });
+    const created = await this.createEvent(dto, { userId: 'system', userName: '系统', userRole: 'system' });
+    created.extraData = { analysisSummary } as any;
+    return (await this.eventRepo.save(created)) as unknown as SecurityEvent;
+  }
+
+  private buildAnalysisSummary(
+    matchedRule: any,
+    eventStartTime: Date,
+    totalDuration: number,
+    segments: Array<any>,
+  ): any {
+    return {
+      generatedAt: new Date(),
+      triggerRule: {
+        ruleId: matchedRule.ruleId,
+        ruleName: matchedRule.ruleName,
+        baseMaxStaySeconds: matchedRule._baseMaxStaySeconds || matchedRule.maxStaySeconds,
+        baseEventLevel: matchedRule._baseEventLevel || matchedRule.eventLevel,
+      },
+      timeSlotMatch: {
+        atTime: eventStartTime,
+        weekday: new Date(eventStartTime).getDay(),
+        timeOfDay: new Date(eventStartTime).toTimeString().slice(0, 5),
+        sensitivityApplied: matchedRule.sensitivity,
+        matchedSlot: matchedRule._matchedSlot || null,
+      },
+      threshold: {
+        effectiveMaxStaySeconds: matchedRule.maxStaySeconds,
+        warningStaySeconds: matchedRule.warningStaySeconds,
+        actualDurationSeconds: totalDuration,
+        exceededBySeconds: totalDuration - matchedRule.maxStaySeconds,
+      },
+      strictModeImpact: {
+        applied: matchedRule.isStrictModeApplied || false,
+        sensitivityMultiplier: matchedRule._strictMultiplier || null,
+        thresholdReducedBy: (matchedRule._baseMaxStaySeconds && matchedRule._baseMaxStaySeconds !== matchedRule.maxStaySeconds)
+          ? matchedRule._baseMaxStaySeconds - matchedRule.maxStaySeconds
+          : 0,
+        levelElevated: (matchedRule._baseEventLevel && matchedRule._baseEventLevel !== matchedRule.eventLevel) || false,
+      },
+      finalDecision: {
+        eventLevel: matchedRule.eventLevel,
+        notificationTargets: matchedRule.notificationTargets,
+        mergeSamePerson: matchedRule.mergeSamePerson,
+        mergeTimeWindowSeconds: matchedRule.mergeTimeWindowSeconds,
+      },
+      mergedSegments: segments,
+    };
+  }
+
+  async getEventAnalysis(id: string): Promise<any> {
+    const event = await this.findEventById(id);
+    const extra = (event.extraData as any) || {};
+
+    const flowTrails = await this.getEventFlowTrails(id);
+    const notifications = await this.eventRepo.query(
+      'SELECT * FROM event_notification WHERE event_id = ? ORDER BY created_at ASC',
+      [id],
+    );
+
+    return {
+      eventBasic: {
+        id: event.id,
+        eventNo: event.eventNo,
+        title: event.title,
+        level: event.eventLevel,
+        status: event.status,
+        personId: event.personId,
+        totalDurationSeconds: event.totalDurationSeconds,
+        areaChangeCount: event.areaChangeCount,
+        involvedAreaIds: event.involvedAreaIds,
+        involvedDeviceIds: event.involvedDeviceIds,
+        createdAt: event.createdAt,
+        firstDetectedAt: event.firstDetectedAt,
+        lastDetectedAt: event.lastDetectedAt,
+      },
+      analysisSummary: extra.analysisSummary || null,
+      mergedSegmentsTimeline: event.stayTimeline || [],
+      flowTrails,
+      notifications: notifications || [],
+    };
+  }
+
+  async batchDispatchEvents(
+    eventIds: string[],
+    dto: DispatchEventDto,
+    operator: any,
+  ): Promise<{ succeeded: string[]; failed: Array<{ eventId: string; reason: string }> }> {
+    const succeeded: string[] = [];
+    const failed: Array<{ eventId: string; reason: string }> = [];
+
+    for (const eventId of eventIds) {
+      try {
+        await this.dispatchEvent(eventId, dto, operator);
+        succeeded.push(eventId);
+      } catch (e: any) {
+        failed.push({ eventId, reason: e.message || '处理失败' });
+      }
+    }
+
+    return { succeeded, failed };
+  }
+
+  async batchCloseEvents(
+    eventIds: string[],
+    dto: CloseEventDto,
+    operator: any,
+  ): Promise<{ succeeded: string[]; failed: Array<{ eventId: string; reason: string }> }> {
+    const succeeded: string[] = [];
+    const failed: Array<{ eventId: string; reason: string }> = [];
+
+    for (const eventId of eventIds) {
+      try {
+        await this.closeEvent(eventId, dto, operator);
+        succeeded.push(eventId);
+      } catch (e: any) {
+        failed.push({ eventId, reason: e.message || '处理失败' });
+      }
+    }
+
+    return { succeeded, failed };
   }
 
   private getSceneName(sceneType?: string): string {

@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In } from 'typeorm';
 import { StayRule, TimeSlotSensitivity, Area, StrictModeConfig } from '../../../infrastructure/entities';
@@ -130,9 +130,11 @@ export class StayRuleService {
     const currentTime = now.format('HH:mm');
     const currentWeekday = now.day();
 
-    let result: MatchedRuleResult = {
+    let result: any = {
       ruleId: rule.id,
       ruleName: rule.name,
+      _baseMaxStaySeconds: rule.maxStaySeconds,
+      _baseEventLevel: rule.eventLevel,
       maxStaySeconds: rule.maxStaySeconds,
       warningStaySeconds: rule.warningStaySeconds,
       eventLevel: rule.eventLevel,
@@ -141,6 +143,7 @@ export class StayRuleService {
       mergeSamePerson: rule.mergeSamePerson,
       mergeTimeWindowSeconds: rule.mergeTimeWindowSeconds,
       isStrictModeApplied: false,
+      _matchedSlot: null,
     };
 
     if (!rule.timeSlotSensitivities || rule.timeSlotSensitivities.length === 0) {
@@ -153,6 +156,16 @@ export class StayRuleService {
 
       if (this.isTimeInRange(currentTime, slot.startTime, slot.endTime)) {
         result.sensitivity = slot.sensitivityLevel;
+        result._matchedSlot = {
+          id: slot.id,
+          name: `${slot.startTime}-${slot.endTime} 时段配置`,
+          weekdays: slot.weekdays,
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          sensitivity: slot.sensitivityLevel,
+          overrideMaxStaySeconds: slot.overrideMaxStaySeconds,
+          overrideEventLevel: slot.overrideEventLevel,
+        };
         if (slot.overrideMaxStaySeconds) {
           result.maxStaySeconds = slot.overrideMaxStaySeconds;
         }
@@ -219,7 +232,19 @@ export class StayRuleService {
     rule: StayRule,
     strictConfig: StrictModeConfig,
   ): MatchedRuleResult {
-    const modified = { ...result, isStrictModeApplied: true };
+    const modified: any = {
+      ...result,
+      isStrictModeApplied: true,
+      _strictMultiplier: strictConfig.sensitivityMultiplier,
+      _strictConfigInfo: {
+        id: strictConfig.id,
+        name: strictConfig.name,
+        modeType: strictConfig.modeType,
+        createdReason: strictConfig.createdReason,
+        startTime: strictConfig.startTime,
+        endTime: strictConfig.endTime,
+      },
+    };
 
     if (rule.strictModeOverride) {
       modified.maxStaySeconds = rule.strictModeOverride.maxStaySeconds;
@@ -239,6 +264,116 @@ export class StayRuleService {
     }
 
     return modified;
+  }
+
+  async simulateMatch(
+    hospitalId: string,
+    areaId: string,
+    startTime: Date,
+    durationSeconds: number,
+  ): Promise<any> {
+    const area = await this.areaRepo.findOneBy({ id: areaId, isDeleted: false }) as Area | null;
+    if (!area) {
+      throw new BadRequestException(`区域不存在: ${areaId}`);
+    }
+
+    const matchedRule = await this.matchRules(areaId, hospitalId, startTime);
+    if (!matchedRule) {
+      const sceneName = this.getSceneName(area.sceneType);
+      return {
+        matched: false,
+        reason: `该区域在指定院区和时段下未配置有效规则`,
+        area: { id: area.id, name: area.name, sceneType: area.sceneType, sceneName },
+        queryInput: { hospitalId, areaId, startTime, durationSeconds },
+      };
+    }
+
+    const triggered = durationSeconds >= matchedRule.maxStaySeconds;
+    const sensitivity = this.getSensitivityMultiplier(matchedRule.sensitivity);
+    const baseInfo = matchedRule as any;
+    const levelText = this.levelText(matchedRule.eventLevel);
+    const sensitivityText = this.sensitivityText(matchedRule.sensitivity);
+    const dayjsT = dayjs(startTime);
+
+    return {
+      matched: true,
+      triggered,
+      queryInput: { hospitalId, areaId, startTime, durationSeconds },
+      area: {
+        id: area.id,
+        name: area.name,
+        sceneType: area.sceneType,
+        sceneName: this.getSceneName(area.sceneType),
+      },
+      matchedRule: {
+        id: matchedRule.ruleId,
+        name: matchedRule.ruleName,
+        baseMaxStaySeconds: baseInfo._baseMaxStaySeconds || matchedRule.maxStaySeconds,
+        baseEventLevel: baseInfo._baseEventLevel || matchedRule.eventLevel,
+      },
+      timeSlotMatch: {
+        weekday: dayjsT.day(),
+        weekdayText: ['周日','周一','周二','周三','周四','周五','周六'][dayjsT.day()],
+        timeOfDay: dayjsT.format('HH:mm'),
+        sensitivity: matchedRule.sensitivity,
+        sensitivityText,
+        sensitivityMultiplier: sensitivity,
+        matchedSlot: baseInfo._matchedSlot,
+      },
+      threshold: {
+        warningStaySeconds: matchedRule.warningStaySeconds,
+        effectiveMaxStaySeconds: matchedRule.maxStaySeconds,
+        actualDurationSeconds: durationSeconds,
+        exceedSeconds: triggered ? durationSeconds - matchedRule.maxStaySeconds : 0,
+        warnThresholdExceeded: durationSeconds >= matchedRule.warningStaySeconds && durationSeconds < matchedRule.maxStaySeconds,
+      },
+      strictModeImpact: baseInfo.isStrictModeApplied ? {
+        applied: true,
+        strictConfig: baseInfo._strictConfigInfo,
+        multiplier: baseInfo._strictMultiplier,
+        thresholdReducedBy: (baseInfo._baseMaxStaySeconds && baseInfo._baseMaxStaySeconds !== matchedRule.maxStaySeconds)
+          ? baseInfo._baseMaxStaySeconds - matchedRule.maxStaySeconds
+          : 0,
+        levelElevated: (baseInfo._baseEventLevel && baseInfo._baseEventLevel !== matchedRule.eventLevel) || false,
+      } : { applied: false },
+      result: {
+        eventLevel: matchedRule.eventLevel,
+        eventLevelText: levelText,
+        notificationTargets: matchedRule.notificationTargets,
+        notificationTargetsText: matchedRule.notificationTargets.map(t => this.notificationTargetText(t)),
+        mergeSamePerson: matchedRule.mergeSamePerson,
+        mergeTimeWindowSeconds: matchedRule.mergeTimeWindowSeconds,
+        summary: triggered
+          ? `[${levelText}]事件，阈值 ${matchedRule.maxStaySeconds}秒，实际 ${durationSeconds}秒，超时 ${durationSeconds - matchedRule.maxStaySeconds}秒`
+          : `未触发，阈值 ${matchedRule.maxStaySeconds}秒，实际 ${durationSeconds}秒，还差 ${matchedRule.maxStaySeconds - durationSeconds}秒`,
+      },
+    };
+  }
+
+  private getSceneName(sceneType?: string): string {
+    const sceneMap: Record<string, string> = {
+      pediatrics: '儿科', emergency: '急诊', operating_room: '手术部', pharmacy: '药库',
+      icu: 'ICU', nicu: 'NICU', ward: '病房', lobby: '大堂', parking: '停车场', other: '其他',
+    };
+    return sceneMap[sceneType || ''] || '监控';
+  }
+
+  private levelText(level: EventLevel): string {
+    const map: Record<string, string> = { low: '低', medium: '中', high: '高', critical: '极高' };
+    return map[level] || level;
+  }
+
+  private sensitivityText(s: SensitivityLevel): string {
+    const map: Record<string, string> = { low: '低灵敏度-阈值放大1.5倍', medium: '中灵敏度-标准', high: '高灵敏度-阈值x0.7', very_high: '极高灵敏度-阈值减半' };
+    return map[s] || s;
+  }
+
+  private notificationTargetText(t: string): string {
+    const map: Record<string, string> = {
+      control_room: '监控室', patrol: '巡逻岗', nurse_station: '护士站',
+      security_supervisor: '安保主管', hospital_admin: '院区管理员', group_admin: '集团管理员',
+    };
+    return map[t] || t;
   }
 
   async getScenePresets(): Promise<Array<{ scene: SceneType; defaultSeconds: number; eventLevel: EventLevel }>> {

@@ -173,3 +173,20 @@ export class MatchedRuleResult {
   mergeTimeWindowSeconds: number;
   isStrictModeApplied: boolean;
 }
+
+export class SimulateRuleDto {
+  @IsString()
+  @IsNotEmpty()
+  hospitalId: string;
+
+  @IsString()
+  @IsNotEmpty()
+  areaId: string;
+
+  @IsNotEmpty()
+  startTime: Date;
+
+  @IsInt()
+  @Min(1)
+  durationSeconds: number;
+}

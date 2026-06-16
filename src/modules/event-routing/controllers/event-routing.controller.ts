@@ -9,6 +9,8 @@ import {
   CloseEventDto,
   MarkFalseAlarmDto,
   CreateEventDto,
+  BatchDispatchDto,
+  BatchCloseDto,
 } from '../dto/event.dto';
 import { PaginationDto, ApiResponseDto } from '../../../common/dto/common.dto';
 import { ContextHelper } from '../../../common/middleware/context.middleware';
@@ -95,5 +97,37 @@ export class EventRoutingController {
   async markFalseAlarm(@Param('id') id: string, @Body() dto: MarkFalseAlarmDto, @Req() req: any) {
     const data = await this.eventService.markFalseAlarm(id, dto, ContextHelper.get(req));
     return ApiResponseDto.success(data, '已标记为误报');
+  }
+
+  @Get(':id/analysis')
+  async getAnalysis(@Param('id') id: string) {
+    const data = await this.eventService.getEventAnalysis(id);
+    return ApiResponseDto.success(data);
+  }
+
+  @Post('batch-dispatch')
+  async batchDispatch(@Body() dto: BatchDispatchDto, @Req() req: any) {
+    const data = await this.eventService.batchDispatchEvents(
+      dto.eventIds,
+      dto.dispatch,
+      ContextHelper.get(req),
+    );
+    return ApiResponseDto.success(
+      data,
+      `批量派单: 成功${data.succeeded.length}条, 失败${data.failed.length}条`,
+    );
+  }
+
+  @Post('batch-close')
+  async batchClose(@Body() dto: BatchCloseDto, @Req() req: any) {
+    const data = await this.eventService.batchCloseEvents(
+      dto.eventIds,
+      dto.close,
+      ContextHelper.get(req),
+    );
+    return ApiResponseDto.success(
+      data,
+      `批量关闭: 成功${data.succeeded.length}条, 失败${data.failed.length}条`,
+    );
   }
 }

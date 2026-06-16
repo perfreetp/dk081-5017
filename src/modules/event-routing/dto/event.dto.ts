@@ -1,4 +1,5 @@
-import { IsString, IsNotEmpty, IsOptional, IsEnum, IsArray, IsBoolean } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsEnum, IsArray, IsBoolean, ArrayNotEmpty, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import { EventLevel, EventStatus, FalseAlarmCategory } from '../../../common/enums';
 
 export class QueryEventDto {
@@ -159,4 +160,24 @@ export class CreateEventDto {
 
   @IsOptional()
   strictModeTriggered?: boolean;
+}
+
+export class BatchDispatchDto {
+  @IsArray()
+  @ArrayNotEmpty()
+  eventIds: string[];
+
+  @ValidateNested()
+  @Type(() => DispatchEventDto)
+  dispatch: DispatchEventDto;
+}
+
+export class BatchCloseDto {
+  @IsArray()
+  @ArrayNotEmpty()
+  eventIds: string[];
+
+  @ValidateNested()
+  @Type(() => CloseEventDto)
+  close: CloseEventDto;
 }
