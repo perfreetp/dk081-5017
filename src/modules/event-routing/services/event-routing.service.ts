@@ -110,6 +110,7 @@ export class EventRoutingService {
       throw new BadRequestException(`当前状态 ${event.status} 不允许派单`);
     }
 
+    const fromStatus = event.status;
     event.status = EventStatus.DISPATCHED;
     event.assignedTo = dto.assignedTo;
     event.dispatchedAt = new Date() as any;
@@ -119,7 +120,7 @@ export class EventRoutingService {
 
     await this.addFlowTrail(
       saved.id,
-      event.status,
+      fromStatus,
       EventStatus.DISPATCHED,
       'event.dispatch',
       dto.remark || `派单给: ${dto.assignedToName || dto.assignedTo}`,
@@ -144,6 +145,7 @@ export class EventRoutingService {
       throw new BadRequestException(`当前状态 ${event.status} 不允许开始处置`);
     }
 
+    const fromStatus = event.status;
     event.status = EventStatus.PROCESSING;
     event.processingStartedAt = new Date();
     event.updatedBy = operator.userId;
@@ -152,7 +154,7 @@ export class EventRoutingService {
 
     await this.addFlowTrail(
       saved.id,
-      EventStatus.DISPATCHED,
+      fromStatus,
       EventStatus.PROCESSING,
       'event.start_processing',
       dto.remark || '开始处置',
@@ -169,6 +171,7 @@ export class EventRoutingService {
       throw new BadRequestException(`当前状态 ${event.status} 不允许升级`);
     }
 
+    const fromStatus = event.status;
     event.isKeyFocus = true;
     event.keyFocusReason = dto.reason;
     event.escalatedAt = new Date();
@@ -188,7 +191,7 @@ export class EventRoutingService {
 
     await this.addFlowTrail(
       saved.id,
-      event.status,
+      fromStatus,
       EventStatus.ESCALATED,
       'event.escalate',
       `升级为重点关注: ${dto.reason}`,
@@ -213,6 +216,7 @@ export class EventRoutingService {
       throw new BadRequestException(`当前状态 ${event.status} 不允许标记已处置`);
     }
 
+    const fromStatus = event.status;
     event.status = EventStatus.RESOLVED;
     event.resolvedAt = new Date();
     event.resolvedBy = operator.userId;
@@ -229,7 +233,7 @@ export class EventRoutingService {
 
     await this.addFlowTrail(
       saved.id,
-      event.status,
+      fromStatus,
       EventStatus.RESOLVED,
       'event.resolve',
       dto.remark,
@@ -247,6 +251,7 @@ export class EventRoutingService {
       throw new BadRequestException(`当前状态 ${event.status} 不允许关闭`);
     }
 
+    const fromStatus = event.status;
     event.status = EventStatus.CLOSED;
     event.closedAt = new Date();
     event.updatedBy = operator.userId;
@@ -255,7 +260,7 @@ export class EventRoutingService {
 
     await this.addFlowTrail(
       saved.id,
-      event.status,
+      fromStatus,
       EventStatus.CLOSED,
       'event.close',
       dto.remark || '事件关闭',
@@ -273,6 +278,7 @@ export class EventRoutingService {
       throw new BadRequestException(`当前状态 ${event.status} 不允许标记误报`);
     }
 
+    const fromStatus = event.status;
     event.status = EventStatus.FALSE_ALARM;
     event.falseAlarmCategory = dto.category;
     event.falseAlarmRemark = dto.remark;
@@ -284,7 +290,7 @@ export class EventRoutingService {
 
     await this.addFlowTrail(
       saved.id,
-      event.status,
+      fromStatus,
       EventStatus.FALSE_ALARM,
       'event.false_alarm',
       `误报分类: ${dto.category}, 说明: ${dto.remark}`,
@@ -336,7 +342,7 @@ export class EventRoutingService {
     let merged = 0;
     const person = await this.personRepo.findOneBy({ id: personId }) as Person;
 
-    let currentEvent: SecurityEvent | null = null;
+    let currentEvent: SecurityEvent | null = await this.findActiveEventForPerson(personId);
     const sortedRecords = records.sort((a, b) =>
       new Date(a.startTime).getTime() - new Date(b.startTime).getTime(),
     );
@@ -344,7 +350,11 @@ export class EventRoutingService {
     for (const record of sortedRecords) {
       if (record.durationSeconds === 0 && !record.endTime) continue;
 
-      const matchedRule = await this.stayRuleService.matchRules(record.areaId, record.hospitalId);
+      const matchedRule = await this.stayRuleService.matchRules(
+        record.areaId,
+        record.hospitalId,
+        record.startTime,
+      );
       if (!matchedRule) {
         record.isProcessed = true;
         await this.stayRecordRepo.save(record);
@@ -499,6 +509,11 @@ export class EventRoutingService {
     assignedTo?: string,
     assignedToName?: string,
   ): Promise<EventFlowTrail> {
+    if (fromStatus === toStatus) {
+      this.logger.warn(`事件 ${eventId} 状态未变更，跳过轨迹记录: ${fromStatus} -> ${toStatus}`);
+      return null as any;
+    }
+
     const trail = this.flowTrailRepo.create({
       eventId,
       fromStatus,
@@ -512,6 +527,30 @@ export class EventRoutingService {
       assignedToName,
     });
     return this.flowTrailRepo.save(trail);
+  }
+
+  private async findActiveEventForPerson(personId: string): Promise<SecurityEvent | null> {
+    const activeStatuses = [
+      EventStatus.PENDING,
+      EventStatus.DISPATCHED,
+      EventStatus.PROCESSING,
+      EventStatus.ESCALATED,
+    ];
+
+    const events = await this.eventRepo.find({
+      where: {
+        personId,
+        status: In(activeStatuses) as any,
+        isDeleted: false,
+      },
+      order: { lastDetectedAt: 'DESC' },
+      take: 1,
+    });
+
+    if (events && events.length > 0) {
+      return events[0] as unknown as SecurityEvent;
+    }
+    return null;
   }
 
   async getEventFlowTrails(eventId: string): Promise<EventFlowTrail[]> {

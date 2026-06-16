@@ -155,15 +155,67 @@ export class StrictModeService {
     config.updatedBy = operator.userId;
     const saved = await this.strictModeRepo.save(config);
 
+    let affectedHospitals: Hospital[] = [];
+
     if (config.hospitalId) {
       const hospital = await this.hospitalRepo.findOneBy({ id: config.hospitalId }) as Hospital;
-      if (hospital) {
+      if (hospital) affectedHospitals = [hospital];
+    } else if (config.scopeHospitalIds && config.scopeHospitalIds.length > 0) {
+      affectedHospitals = await this.hospitalRepo.findByIds(config.scopeHospitalIds) as Hospital[];
+    } else {
+      affectedHospitals = await this.hospitalRepo.find({ where: { isDeleted: false } }) as Hospital[];
+    }
+
+    for (const hospital of affectedHospitals) {
+      if (!hospital) continue;
+
+      const otherActiveConfigs = await this.getActiveConfigsForHospital(hospital.id, config.id);
+      if (otherActiveConfigs.length === 0) {
         hospital.strictModeConfig = { enabled: false, mode: '', startTime: null, endTime: null, reason: '' };
         await this.hospitalRepo.save(hospital);
+        this.logger.log(`院区 ${hospital.name} 已恢复正常状态`);
+      } else {
+        const topConfig = otherActiveConfigs[0];
+        hospital.strictModeConfig = {
+          enabled: true,
+          mode: topConfig.modeType,
+          startTime: topConfig.startTime,
+          endTime: topConfig.endTime,
+          reason: topConfig.createdReason || topConfig.description || '',
+        };
+        await this.hospitalRepo.save(hospital);
+        this.logger.log(`院区 ${hospital.name} 仍受其他严控模式管控: ${topConfig.name}`);
       }
     }
 
+    this.eventEmitter.emit('audit.log', {
+      actionType: 'strict_mode.disable',
+      actionTarget: saved.id,
+      actionDetail: `已停用严控模式，影响 ${affectedHospitals.length} 个院区`,
+      userId: operator.userId,
+      userName: operator.userName,
+      userRole: operator.userRole,
+    });
+
     return saved;
+  }
+
+  private async getActiveConfigsForHospital(hospitalId: string, excludeConfigId?: string): Promise<StrictModeConfig[]> {
+    const now = new Date();
+    let qb = this.strictModeRepo
+      .createQueryBuilder('s')
+      .where('s.isDeleted = 0 AND s.enabled = 1 AND s.startTime <= :now AND s.endTime >= :now', { now });
+
+    if (excludeConfigId) {
+      qb = qb.andWhere('s.id != :excludeId', { excludeId: excludeConfigId });
+    }
+
+    const allConfigs = await qb.getMany();
+    return allConfigs.filter(config => {
+      if (config.hospitalId && config.hospitalId !== hospitalId) return false;
+      if (config.scopeHospitalIds && config.scopeHospitalIds.length > 0 && !config.scopeHospitalIds.includes(hospitalId)) return false;
+      return true;
+    });
   }
 
   async getGroupStrictModeStatus(): Promise<any> {
