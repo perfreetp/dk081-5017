@@ -350,6 +350,63 @@ export class StayRuleService {
     };
   }
 
+  async batchSimulate(scenarios: Array<{ hospitalId: string; areaId: string; startTime: Date; durationSeconds: number; label?: string }>): Promise<any> {
+    const results = [];
+    let triggeredCount = 0;
+    let strictTriggeredCount = 0;
+    const levelCounts: Record<string, number> = {};
+
+    for (let i = 0; i < scenarios.length; i++) {
+      const s = scenarios[i];
+      try {
+        const r = await this.simulateMatch(s.hospitalId, s.areaId, new Date(s.startTime), s.durationSeconds);
+        if (r.triggered) triggeredCount++;
+        if (r.strictModeImpact?.applied) strictTriggeredCount++;
+        if (r.result?.eventLevel) {
+          levelCounts[r.result.eventLevel] = (levelCounts[r.result.eventLevel] || 0) + 1;
+        }
+        results.push({
+          index: i,
+          label: s.label || `场景${i + 1}`,
+          input: { hospitalId: s.hospitalId, areaId: s.areaId, startTime: s.startTime, durationSeconds: s.durationSeconds },
+          matched: r.matched,
+          triggered: r.triggered,
+          eventLevel: r.result?.eventLevel,
+          eventLevelText: r.result?.eventLevelText,
+          threshold: r.threshold,
+          sensitivity: r.timeSlotMatch?.sensitivity,
+          strictModeApplied: r.strictModeImpact?.applied || false,
+          summary: r.result?.summary,
+          error: null,
+        });
+      } catch (e: any) {
+        results.push({
+          index: i,
+          label: s.label || `场景${i + 1}`,
+          input: { hospitalId: s.hospitalId, areaId: s.areaId, startTime: s.startTime, durationSeconds: s.durationSeconds },
+          matched: false,
+          triggered: false,
+          eventLevel: null,
+          eventLevelText: null,
+          threshold: null,
+          sensitivity: null,
+          strictModeApplied: false,
+          summary: null,
+          error: e.message || '计算失败',
+        });
+      }
+    }
+
+    return {
+      total: scenarios.length,
+      triggered: triggeredCount,
+      notTriggered: scenarios.length - triggeredCount,
+      strictTriggered: strictTriggeredCount,
+      levelDistribution: levelCounts,
+      results,
+    };
+  }
+
   private getSceneName(sceneType?: string): string {
     const sceneMap: Record<string, string> = {
       pediatrics: '儿科', emergency: '急诊', operating_room: '手术部', pharmacy: '药库',

@@ -5,6 +5,7 @@ import {
   UpdateStayRuleDto,
   QueryStayRuleDto,
   SimulateRuleDto,
+  BatchSimulateDto,
 } from '../dto/stay-rule.dto';
 import { PaginationDto, ApiResponseDto } from '../../../common/dto/common.dto';
 import { ContextHelper } from '../../../common/middleware/context.middleware';
@@ -61,5 +62,14 @@ export class StayRuleController {
       dto.durationSeconds,
     );
     return ApiResponseDto.success(data);
+  }
+
+  @Post('batch-simulate')
+  async batchSimulate(@Body() dto: BatchSimulateDto) {
+    const data = await this.stayRuleService.batchSimulate(dto.scenarios);
+    return ApiResponseDto.success(
+      data,
+      `批量试算完成: 触发 ${data.triggered}/${data.total}, 严控模式下 ${data.strictTriggered} 条`,
+    );
   }
 }

@@ -7,6 +7,7 @@ import {
   PersonStayRecord,
   Person,
   Area,
+  EventNotification,
 } from '../../../infrastructure/entities';
 import {
   QueryEventDto,
@@ -32,6 +33,7 @@ export class EventRoutingService {
   constructor(
     @InjectRepository(SecurityEvent) private readonly eventRepo: Repository<SecurityEvent>,
     @InjectRepository(EventFlowTrail) private readonly flowTrailRepo: Repository<EventFlowTrail>,
+    @InjectRepository(EventNotification) private readonly notificationRepo: Repository<EventNotification>,
     @InjectRepository(PersonStayRecord) private readonly stayRecordRepo: Repository<PersonStayRecord>,
     @InjectRepository(Person) private readonly personRepo: Repository<Person>,
     @InjectRepository(Area) private readonly areaRepo: Repository<Area>,
@@ -423,6 +425,7 @@ export class EventRoutingService {
 
     if (event.stayTimeline) {
       event.stayTimeline.push({
+        recordId: record.id,
         areaId: record.areaId,
         deviceId: record.deviceId,
         startTime: record.startTime,
@@ -511,6 +514,7 @@ export class EventRoutingService {
       totalDurationSeconds: duration,
       stayTimeline: [
         {
+          recordId: record.id,
           areaId: record.areaId,
           deviceId: record.deviceId,
           startTime: record.startTime,
@@ -576,11 +580,24 @@ export class EventRoutingService {
     const event = await this.findEventById(id);
     const extra = (event.extraData as any) || {};
 
-    const flowTrails = await this.getEventFlowTrails(id);
-    const notifications = await this.eventRepo.query(
-      'SELECT * FROM event_notification WHERE event_id = ? ORDER BY created_at ASC',
-      [id],
-    );
+    let flowTrails: EventFlowTrail[] = [];
+    try {
+      flowTrails = await this.getEventFlowTrails(id);
+    } catch (e) {
+      this.logger.warn(`获取事件 ${id} 流转轨迹失败: ${e.message}`);
+    }
+
+    let notifications: EventNotification[] = [];
+    try {
+      notifications = await this.notificationRepo.find({
+        where: { eventId: id, isDeleted: false },
+        order: { createdAt: 'ASC' as any },
+      }) as EventNotification[];
+    } catch (e) {
+      this.logger.warn(`获取事件 ${id} 通知记录失败: ${e.message}`);
+    }
+
+    const timelineWithType = this.decorateTimeline(event);
 
     return {
       eventBasic: {
@@ -597,12 +614,223 @@ export class EventRoutingService {
         createdAt: event.createdAt,
         firstDetectedAt: event.firstDetectedAt,
         lastDetectedAt: event.lastDetectedAt,
+        isKeyFocus: event.isKeyFocus,
+        strictModeTriggered: event.strictModeTriggered,
       },
       analysisSummary: extra.analysisSummary || null,
-      mergedSegmentsTimeline: event.stayTimeline || [],
+      stayTimeline: timelineWithType,
       flowTrails,
       notifications: notifications || [],
+      currentStage: this.getCurrentStage(event),
     };
+  }
+
+  async exportEventReview(id: string): Promise<any> {
+    const event = await this.findEventById(id);
+    const analysis = await this.getEventAnalysis(id);
+    const extra = (event.extraData as any) || {};
+
+    const finalConclusion = this.buildFinalConclusion(event, analysis);
+
+    return {
+      exportMeta: {
+        exportedAt: new Date(),
+        eventNo: event.eventNo,
+        title: event.title,
+      },
+      overview: {
+        eventNo: event.eventNo,
+        title: event.title,
+        level: event.eventLevel,
+        status: event.status,
+        hospitalId: event.hospitalId,
+        personId: event.personId,
+        totalDurationMinutes: Math.round(event.totalDurationSeconds / 60),
+        areaCount: event.involvedAreaIds.length,
+        areaChangeCount: event.areaChangeCount,
+        firstDetectedAt: event.firstDetectedAt,
+        lastDetectedAt: event.lastDetectedAt,
+        isKeyFocus: event.isKeyFocus,
+        strictModeTriggered: event.strictModeTriggered,
+      },
+      triggerAnalysis: extra.analysisSummary || null,
+      stayTimeline: analysis.stayTimeline,
+      notifications: analysis.notifications.map((n: any) => ({
+        targetType: n.targetType,
+        targetName: n.targetName,
+        channel: n.channel,
+        title: n.title,
+        sentAt: n.sentAt,
+        isRead: n.isRead,
+        sendSuccess: n.sendSuccess,
+      })),
+      dispositionTrail: analysis.flowTrails.map((t: any) => ({
+        actionType: t.actionType,
+        fromStatus: t.fromStatus,
+        toStatus: t.toStatus,
+        operatorName: t.operatorName,
+        remark: t.remark,
+        assignedToName: t.assignedToName,
+        occurredAt: t.createdAt,
+      })),
+      finalConclusion,
+    };
+  }
+
+  private buildFinalConclusion(event: SecurityEvent, analysis: any): any {
+    const flowTrails = analysis.flowTrails || [];
+    const notifications = analysis.notifications || [];
+    const isClosed = [
+      EventStatus.CLOSED, EventStatus.RESOLVED, EventStatus.FALSE_ALARM,
+    ].includes(event.status as any);
+
+    return {
+      isClosed,
+      closeStatus: event.status,
+      dispositionResult: event.dispositionRemark || null,
+      falseAlarmCategory: event.falseAlarmCategory || null,
+      falseAlarmRemark: event.falseAlarmRemark || null,
+      dispatched: event.dispatchedAt ? true : false,
+      dispatchedAt: event.dispatchedAt,
+      assignedTo: event.assignedToName || event.assignedTo,
+      processingDurationMinutes: event.resolvedAt && event.dispatchedAt
+        ? Math.round((new Date(event.resolvedAt).getTime() - new Date(event.dispatchedAt).getTime()) / 60000)
+        : null,
+      notificationCount: notifications.length,
+      trailCount: flowTrails.length,
+      closedAt: event.resolvedAt || event.closedAt || null,
+      closedBy: event.updatedBy,
+    };
+  }
+
+  private decorateTimeline(event: SecurityEvent): any[] {
+    if (!event.stayTimeline || event.stayTimeline.length === 0) return [];
+    const extra = (event.extraData as any) || {};
+    const summary = extra.analysisSummary || null;
+    const segments = summary?.mergedSegments || [];
+    const recordIdToType: Record<string, string> = {};
+    for (const seg of segments) {
+      recordIdToType[seg.recordId] = seg.isTriggerSegment ? 'trigger' : 'supplement';
+    }
+    return event.stayTimeline.map((item: any, idx: number) => ({
+      ...item,
+      segmentType: idx === 0 ? 'trigger' : (recordIdToType[item.recordId] || 'supplement'),
+      durationMinutes: Math.round(item.durationSeconds / 60),
+    }));
+  }
+
+  private getCurrentStage(event: SecurityEvent): { stage: string; stageText: string; stuckSeconds?: number } {
+    const now = Date.now();
+    let stage = 'unknown';
+    let stageText = '未知';
+    let refTime: Date | null = null;
+
+    switch (event.status) {
+      case EventStatus.PENDING:
+        stage = 'pending_dispatch';
+        stageText = '待派单';
+        refTime = event.createdAt;
+        break;
+      case EventStatus.DISPATCHED:
+        stage = 'pending_process';
+        stageText = '待处置';
+        refTime = event.dispatchedAt as any;
+        break;
+      case EventStatus.PROCESSING:
+        stage = 'processing';
+        stageText = '处置中';
+        refTime = event.processingStartedAt;
+        break;
+      case EventStatus.ESCALATED:
+        stage = 'escalated';
+        stageText = '已升级重点关注';
+        refTime = event.escalatedAt;
+        break;
+      case EventStatus.RESOLVED:
+        stage = 'resolved';
+        stageText = '已处置';
+        break;
+      case EventStatus.CLOSED:
+        stage = 'closed';
+        stageText = '已关闭';
+        break;
+      case EventStatus.FALSE_ALARM:
+        stage = 'false_alarm';
+        stageText = '误报';
+        break;
+      default:
+        break;
+    }
+
+    const result: any = { stage, stageText };
+    if (refTime) {
+      result.stuckSeconds = Math.round((now - new Date(refTime).getTime()) / 1000);
+      result.stuckMinutes = Math.round(result.stuckSeconds / 60);
+    }
+    return result;
+  }
+
+  async getSupervisionList(
+    hospitalId?: string,
+    viewType: 'all' | 'pending_dispatch_timeout' | 'process_timeout' | 'strict_unclosed' = 'all',
+    dispatchTimeoutMinutes = 30,
+    processTimeoutMinutes = 120,
+    pagination?: PaginationDto,
+  ): Promise<any> {
+    let qb = this.eventRepo
+      .createQueryBuilder('e')
+      .where('e.isDeleted = :isDeleted', { isDeleted: false });
+
+    if (hospitalId) {
+      qb = qb.andWhere('e.hospitalId = :hospitalId', { hospitalId });
+    }
+
+    switch (viewType) {
+      case 'pending_dispatch_timeout':
+        qb = qb.andWhere('e.status = :st', { st: EventStatus.PENDING })
+          .andWhere(`(julianday('now') - julianday(e.created_at)) * 1440 >= :t`, { t: dispatchTimeoutMinutes });
+        break;
+      case 'process_timeout':
+        qb = qb.andWhere('e.status IN (:...sts)', { sts: [EventStatus.DISPATCHED, EventStatus.PROCESSING] })
+          .andWhere(`(julianday('now') - julianday(COALESCE(e.dispatched_at, e.created_at))) * 1440 >= :t`, { t: processTimeoutMinutes });
+        break;
+      case 'strict_unclosed':
+        qb = qb.andWhere('e.strict_mode_triggered = 1')
+          .andWhere('e.status NOT IN (:...sts)', { sts: [EventStatus.CLOSED, EventStatus.RESOLVED, EventStatus.FALSE_ALARM] });
+        break;
+      default:
+        break;
+    }
+
+    const total = await qb.getCount();
+
+    if (pagination) {
+      const page = pagination.page || 1;
+      const pageSize = pagination.pageSize || 20;
+      qb = qb.orderBy('e.created_at', 'DESC').skip((page - 1) * pageSize).take(pageSize);
+    }
+
+    const events = await qb.getMany();
+    const list = events.map(e => {
+      const stage = this.getCurrentStage(e);
+      return {
+        id: e.id,
+        eventNo: e.eventNo,
+        title: e.title,
+        level: e.eventLevel,
+        status: e.status,
+        hospitalId: e.hospitalId,
+        totalDurationSeconds: e.totalDurationSeconds,
+        isKeyFocus: e.isKeyFocus,
+        strictModeTriggered: e.strictModeTriggered,
+        createdAt: e.createdAt,
+        firstDetectedAt: e.firstDetectedAt,
+        lastDetectedAt: e.lastDetectedAt,
+        currentStage: stage,
+      };
+    });
+
+    return { total, list, viewType, filters: { hospitalId, dispatchTimeoutMinutes, processTimeoutMinutes } };
   }
 
   async batchDispatchEvents(

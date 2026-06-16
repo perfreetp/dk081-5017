@@ -1,4 +1,5 @@
-import { IsString, IsNotEmpty, IsOptional, MaxLength, IsInt, Min, IsArray, IsBoolean, IsEnum } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, MaxLength, IsInt, Min, IsArray, IsBoolean, IsEnum, ValidateNested, ArrayNotEmpty } from 'class-validator';
+import { Type } from 'class-transformer';
 import { EventLevel, SensitivityLevel, SceneType } from '../../../common/enums';
 
 export class CreateTimeSlotDto {
@@ -189,4 +190,16 @@ export class SimulateRuleDto {
   @IsInt()
   @Min(1)
   durationSeconds: number;
+
+  @IsOptional()
+  @IsString()
+  label?: string;
+}
+
+export class BatchSimulateDto {
+  @IsArray()
+  @ArrayNotEmpty()
+  @ValidateNested({ each: true })
+  @Type(() => SimulateRuleDto)
+  scenarios: SimulateRuleDto[];
 }

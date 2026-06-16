@@ -105,6 +105,30 @@ export class EventRoutingController {
     return ApiResponseDto.success(data);
   }
 
+  @Get(':id/export-review')
+  async exportReview(@Param('id') id: string) {
+    const data = await this.eventService.exportEventReview(id);
+    return ApiResponseDto.success(data, '复盘数据导出成功');
+  }
+
+  @Get('supervision/list')
+  async supervisionList(
+    @Query('hospitalId') hospitalId?: string,
+    @Query('viewType') viewType?: 'all' | 'pending_dispatch_timeout' | 'process_timeout' | 'strict_unclosed',
+    @Query('dispatchTimeoutMinutes') dispatchTimeoutMinutes?: string,
+    @Query('processTimeoutMinutes') processTimeoutMinutes?: string,
+    @Query() pagination?: PaginationDto,
+  ) {
+    const data = await this.eventService.getSupervisionList(
+      hospitalId,
+      (viewType as any) || 'all',
+      dispatchTimeoutMinutes ? parseInt(dispatchTimeoutMinutes, 10) : 30,
+      processTimeoutMinutes ? parseInt(processTimeoutMinutes, 10) : 120,
+      pagination,
+    );
+    return ApiResponseDto.success(data);
+  }
+
   @Post('batch-dispatch')
   async batchDispatch(@Body() dto: BatchDispatchDto, @Req() req: any) {
     const data = await this.eventService.batchDispatchEvents(
