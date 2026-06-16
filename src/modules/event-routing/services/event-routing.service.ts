@@ -75,6 +75,15 @@ export class EventRoutingService {
     return event;
   }
 
+  async findEventByNo(eventNo: string): Promise<SecurityEvent> {
+    const event = await this.eventRepo.findOne({
+      where: { eventNo, isDeleted: false },
+      relations: ['person', 'flowTrails', 'notifications'],
+    }) as SecurityEvent;
+    if (!event) throw new NotFoundException(`事件编号不存在: ${eventNo}`);
+    return event;
+  }
+
   async queryEvents(query: QueryEventDto, pagination: PaginationDto): Promise<PaginatedResultDto<SecurityEvent>> {
     const qb = this.eventRepo.createQueryBuilder('e').where('e.isDeleted = :isDeleted', { isDeleted: false });
 
@@ -677,6 +686,258 @@ export class EventRoutingService {
     };
   }
 
+  async getEventAnalysisByNo(eventNo: string): Promise<any> {
+    const event = await this.findEventByNo(eventNo);
+    return this.getEventAnalysis(event.id);
+  }
+
+  async exportEventReviewByNo(eventNo: string): Promise<any> {
+    const event = await this.findEventByNo(eventNo);
+    return this.exportEventReview(event.id);
+  }
+
+  async getReviewReport(
+    hospitalId?: string,
+    startDate?: Date,
+    endDate?: Date,
+  ): Promise<any> {
+    let qb = this.eventRepo
+      .createQueryBuilder('e')
+      .where('e.isDeleted = :isDeleted', { isDeleted: false });
+
+    if (hospitalId) {
+      qb = qb.andWhere('e.hospitalId = :hospitalId', { hospitalId });
+    }
+    if (startDate) {
+      qb = qb.andWhere('e.first_detected_at >= :startDate', { startDate });
+    }
+    if (endDate) {
+      qb = qb.andWhere('e.first_detected_at <= :endDate', { endDate });
+    }
+
+    const events = await qb.orderBy('e.first_detected_at', 'DESC').getMany();
+    const total = events.length;
+
+    const byLevel: Record<string, number> = {};
+    const byStatus: Record<string, number> = {};
+    const byRule: Record<string, { count: number; ruleName: string }> = {};
+    const byScene: Record<string, number> = {};
+    const strictTriggeredCount = events.filter(e => e.strictModeTriggered).length;
+    const keyFocusCount = events.filter(e => e.isKeyFocus).length;
+    const falseAlarmCount = events.filter(e => e.status === EventStatus.FALSE_ALARM).length;
+
+    let totalDuration = 0;
+
+    for (const evt of events) {
+      byLevel[evt.eventLevel] = (byLevel[evt.eventLevel] || 0) + 1;
+      byStatus[evt.status] = (byStatus[evt.status] || 0) + 1;
+      if (evt.matchedRuleId) {
+        if (!byRule[evt.matchedRuleId]) {
+          byRule[evt.matchedRuleId] = { count: 0, ruleName: evt.matchedRuleName || '未知规则' };
+        }
+        byRule[evt.matchedRuleId].count++;
+      }
+      totalDuration += evt.totalDurationSeconds || 0;
+    }
+
+    const avgDuration = total > 0 ? Math.round(totalDuration / total) : 0;
+
+    const eventSummaries = events.map(e => {
+      const stage = this.getCurrentStage(e);
+      return {
+        id: e.id,
+        eventNo: e.eventNo,
+        title: e.title,
+        level: e.eventLevel,
+        status: e.status,
+        matchedRuleId: e.matchedRuleId,
+        matchedRuleName: e.matchedRuleName,
+        totalDurationSeconds: e.totalDurationSeconds,
+        areaChangeCount: e.areaChangeCount,
+        isKeyFocus: e.isKeyFocus,
+        strictModeTriggered: e.strictModeTriggered,
+        firstDetectedAt: e.firstDetectedAt,
+        lastDetectedAt: e.lastDetectedAt,
+        closedAt: e.resolvedAt || (e as any).closedAt || null,
+        assignedTo: e.assignedToName || e.assignedTo,
+        currentStage: stage,
+      };
+    });
+
+    return {
+      reportMeta: {
+        generatedAt: new Date(),
+        hospitalId: hospitalId || 'all',
+        startDate,
+        endDate,
+        totalEvents: total,
+      },
+      summaryStats: {
+        total,
+        strictTriggered: strictTriggeredCount,
+        keyFocus: keyFocusCount,
+        falseAlarmCount,
+        falseAlarmRate: total > 0 ? +(falseAlarmCount / total * 100).toFixed(2) : 0,
+        avgDurationSeconds: avgDuration,
+        avgDurationMinutes: Math.round(avgDuration / 60),
+      },
+      byLevel,
+      byStatus,
+      byRule: Object.entries(byRule).map(([id, info]) => ({
+        ruleId: id,
+        ruleName: info.ruleName,
+        count: info.count,
+      })).sort((a, b) => b.count - a.count),
+      eventSummaries,
+    };
+  }
+
+  async getSupervisionStats(
+    hospitalId?: string,
+    dispatchTimeoutMinutes = 30,
+    processTimeoutMinutes = 120,
+  ): Promise<any> {
+    let qb = this.eventRepo
+      .createQueryBuilder('e')
+      .where('e.isDeleted = :isDeleted', { isDeleted: false })
+      .andWhere('e.status NOT IN (:...closedStatuses)', {
+        closedStatuses: [EventStatus.CLOSED, EventStatus.RESOLVED, EventStatus.FALSE_ALARM],
+      });
+
+    if (hospitalId) {
+      qb = qb.andWhere('e.hospitalId = :hospitalId', { hospitalId });
+    }
+
+    const events = await qb.getMany();
+
+    const byStage: Record<string, { count: number; stageText: string; timeoutCount: number }> = {
+      pending_dispatch: { count: 0, stageText: '待派单', timeoutCount: 0 },
+      pending_process: { count: 0, stageText: '待处置', timeoutCount: 0 },
+      processing: { count: 0, stageText: '处置中', timeoutCount: 0 },
+      escalated: { count: 0, stageText: '已升级重点关注', timeoutCount: 0 },
+    };
+
+    const byAssignee: Record<string, {
+      assignee: string;
+      assigneeName: string;
+      total: number;
+      pendingDispatch: number;
+      pendingProcess: number;
+      processing: number;
+      escalated: number;
+      timeoutCount: number;
+      maxStuckMinutes: number;
+    }> = {};
+
+    const now = Date.now();
+
+    for (const evt of events) {
+      const stage = this.getCurrentStage(evt);
+      const stageKey = stage.stage;
+
+      if (byStage[stageKey]) {
+        byStage[stageKey].count++;
+        const isTimeout = (stage.stuckMinutes || 0) >=
+          (stageKey === 'pending_dispatch' ? dispatchTimeoutMinutes : processTimeoutMinutes);
+        if (isTimeout) byStage[stageKey].timeoutCount++;
+      }
+
+      const assignee = evt.assignedTo || 'unassigned';
+      const assigneeName = evt.assignedToName || '未指派';
+      if (!byAssignee[assignee]) {
+        byAssignee[assignee] = {
+          assignee,
+          assigneeName,
+          total: 0,
+          pendingDispatch: 0,
+          pendingProcess: 0,
+          processing: 0,
+          escalated: 0,
+          timeoutCount: 0,
+          maxStuckMinutes: 0,
+        };
+      }
+      byAssignee[assignee].total++;
+      const stuckMin = stage.stuckMinutes || 0;
+      if (stuckMin > byAssignee[assignee].maxStuckMinutes) {
+        byAssignee[assignee].maxStuckMinutes = stuckMin;
+      }
+
+      const isTimeout =
+        (stageKey === 'pending_dispatch' && stuckMin >= dispatchTimeoutMinutes) ||
+        (stageKey !== 'pending_dispatch' && stageKey !== 'unknown' && stuckMin >= processTimeoutMinutes);
+      if (isTimeout) byAssignee[assignee].timeoutCount++;
+
+      switch (stageKey) {
+        case 'pending_dispatch': byAssignee[assignee].pendingDispatch++; break;
+        case 'pending_process': byAssignee[assignee].pendingProcess++; break;
+        case 'processing': byAssignee[assignee].processing++; break;
+        case 'escalated': byAssignee[assignee].escalated++; break;
+      }
+    }
+
+    const assigneeList = Object.values(byAssignee).sort((a, b) => b.total - a.total);
+
+    return {
+      totalOpen: events.length,
+      dispatchTimeoutMinutes,
+      processTimeoutMinutes,
+      byStage,
+      byAssignee: assigneeList,
+      totalTimeout: Object.values(byStage).reduce((sum, s) => sum + s.timeoutCount, 0),
+    };
+  }
+
+  async getAssigneeEventList(
+    assignee: string,
+    hospitalId?: string,
+    pagination?: PaginationDto,
+  ): Promise<any> {
+    let qb = this.eventRepo
+      .createQueryBuilder('e')
+      .where('e.isDeleted = :isDeleted', { isDeleted: false })
+      .andWhere('e.status NOT IN (:...closedStatuses)', {
+        closedStatuses: [EventStatus.CLOSED, EventStatus.RESOLVED, EventStatus.FALSE_ALARM],
+      });
+
+    if (assignee === 'unassigned') {
+      qb = qb.andWhere('(e.assigned_to IS NULL OR e.assigned_to = "")');
+    } else {
+      qb = qb.andWhere('e.assigned_to = :assignee', { assignee });
+    }
+
+    if (hospitalId) {
+      qb = qb.andWhere('e.hospital_id = :hospitalId', { hospitalId });
+    }
+
+    const total = await qb.getCount();
+
+    if (pagination) {
+      const page = pagination.page || 1;
+      const pageSize = pagination.pageSize || 20;
+      qb = qb.orderBy('e.created_at', 'DESC').skip((page - 1) * pageSize).take(pageSize);
+    }
+
+    const events = await qb.getMany();
+    const list = events.map(e => {
+      const stage = this.getCurrentStage(e);
+      return {
+        id: e.id,
+        eventNo: e.eventNo,
+        title: e.title,
+        level: e.eventLevel,
+        status: e.status,
+        isKeyFocus: e.isKeyFocus,
+        strictModeTriggered: e.strictModeTriggered,
+        firstDetectedAt: e.firstDetectedAt,
+        totalDurationSeconds: e.totalDurationSeconds,
+        currentStage: stage,
+      };
+    });
+
+    return { total, assignee, list };
+  }
+
   private buildFinalConclusion(event: SecurityEvent, analysis: any): any {
     const flowTrails = analysis.flowTrails || [];
     const notifications = analysis.notifications || [];
@@ -719,7 +980,7 @@ export class EventRoutingService {
     }));
   }
 
-  private getCurrentStage(event: SecurityEvent): { stage: string; stageText: string; stuckSeconds?: number } {
+  private getCurrentStage(event: SecurityEvent): { stage: string; stageText: string; stuckSeconds?: number; stuckMinutes?: number } {
     const now = Date.now();
     let stage = 'unknown';
     let stageText = '未知';

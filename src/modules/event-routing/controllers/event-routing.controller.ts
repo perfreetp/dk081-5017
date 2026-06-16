@@ -105,10 +105,36 @@ export class EventRoutingController {
     return ApiResponseDto.success(data);
   }
 
+  @Get('by-no/:eventNo/analysis')
+  async getAnalysisByNo(@Param('eventNo') eventNo: string) {
+    const data = await this.eventService.getEventAnalysisByNo(eventNo);
+    return ApiResponseDto.success(data);
+  }
+
   @Get(':id/export-review')
   async exportReview(@Param('id') id: string) {
     const data = await this.eventService.exportEventReview(id);
     return ApiResponseDto.success(data, '复盘数据导出成功');
+  }
+
+  @Get('by-no/:eventNo/export-review')
+  async exportReviewByNo(@Param('eventNo') eventNo: string) {
+    const data = await this.eventService.exportEventReviewByNo(eventNo);
+    return ApiResponseDto.success(data, '复盘数据导出成功');
+  }
+
+  @Get('review-report')
+  async reviewReport(
+    @Query('hospitalId') hospitalId?: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    const data = await this.eventService.getReviewReport(
+      hospitalId,
+      startDate ? new Date(startDate) : undefined,
+      endDate ? new Date(endDate) : undefined,
+    );
+    return ApiResponseDto.success(data, '复盘报告生成成功');
   }
 
   @Get('supervision/list')
@@ -126,6 +152,30 @@ export class EventRoutingController {
       processTimeoutMinutes ? parseInt(processTimeoutMinutes, 10) : 120,
       pagination,
     );
+    return ApiResponseDto.success(data);
+  }
+
+  @Get('supervision/stats')
+  async supervisionStats(
+    @Query('hospitalId') hospitalId?: string,
+    @Query('dispatchTimeoutMinutes') dispatchTimeoutMinutes?: string,
+    @Query('processTimeoutMinutes') processTimeoutMinutes?: string,
+  ) {
+    const data = await this.eventService.getSupervisionStats(
+      hospitalId,
+      dispatchTimeoutMinutes ? parseInt(dispatchTimeoutMinutes, 10) : 30,
+      processTimeoutMinutes ? parseInt(processTimeoutMinutes, 10) : 120,
+    );
+    return ApiResponseDto.success(data);
+  }
+
+  @Get('supervision/assignee/:assignee/list')
+  async assigneeEventList(
+    @Param('assignee') assignee: string,
+    @Query('hospitalId') hospitalId?: string,
+    @Query() pagination?: PaginationDto,
+  ) {
+    const data = await this.eventService.getAssigneeEventList(assignee, hospitalId, pagination);
     return ApiResponseDto.success(data);
   }
 

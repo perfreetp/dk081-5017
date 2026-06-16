@@ -70,6 +70,7 @@ export class SecurityEvent extends BaseEntity {
 
   @Column({ type: 'simple-json', nullable: true, name: 'stay_timeline', comment: '停留时间线记录' })
   stayTimeline: Array<{
+    recordId?: string;
     areaId: string;
     deviceId: string;
     startTime: Date;
@@ -123,6 +124,9 @@ export class SecurityEvent extends BaseEntity {
 
   @Column({ length: 50, nullable: true, name: 'assigned_to', comment: '当前处置人' })
   assignedTo: string;
+
+  @Column({ length: 100, nullable: true, name: 'assigned_to_name', comment: '当前处置人名称' })
+  assignedToName: string;
 
   @Column({ length: 50, nullable: true, name: 'resolved_by' })
   resolvedBy: string;

@@ -354,43 +354,98 @@ export class StayRuleService {
     const results = [];
     let triggeredCount = 0;
     let strictTriggeredCount = 0;
+    let nightTimeCount = 0;
     const levelCounts: Record<string, number> = {};
+    const triggerReasons = {
+      normal: { count: 0, labels: [] as string[] },
+      nightSensitivity: { count: 0, labels: [] as string[] },
+      strictMode: { count: 0, labels: [] as string[] },
+      nightAndStrict: { count: 0, labels: [] as string[] },
+    };
+    const ruleHits: Record<string, { ruleId: string; ruleName: string; count: number; triggeredCount: number }> = {};
 
     for (let i = 0; i < scenarios.length; i++) {
       const s = scenarios[i];
+      const label = s.label || `场景${i + 1}`;
       try {
         const r = await this.simulateMatch(s.hospitalId, s.areaId, new Date(s.startTime), s.durationSeconds);
         if (r.triggered) triggeredCount++;
         if (r.strictModeImpact?.applied) strictTriggeredCount++;
+
+        const isNightTime = this.isNightTime(new Date(s.startTime));
+        if (isNightTime) nightTimeCount++;
+
         if (r.result?.eventLevel) {
           levelCounts[r.result.eventLevel] = (levelCounts[r.result.eventLevel] || 0) + 1;
         }
+
+        const ruleId = r.matchedRule?.id || 'none';
+        const ruleName = r.matchedRule?.name || '未匹配';
+        if (!ruleHits[ruleId]) {
+          ruleHits[ruleId] = { ruleId, ruleName, count: 0, triggeredCount: 0 };
+        }
+        ruleHits[ruleId].count++;
+        if (r.triggered) ruleHits[ruleId].triggeredCount++;
+
+        let reasonCategory = 'normal';
+        if (r.strictModeImpact?.applied && isNightTime) {
+          reasonCategory = 'nightAndStrict';
+        } else if (r.strictModeImpact?.applied) {
+          reasonCategory = 'strictMode';
+        } else if (isNightTime) {
+          reasonCategory = 'nightSensitivity';
+        }
+        if (r.triggered) {
+          triggerReasons[reasonCategory].count++;
+          triggerReasons[reasonCategory].labels.push(label);
+        }
+
         results.push({
           index: i,
-          label: s.label || `场景${i + 1}`,
+          label,
           input: { hospitalId: s.hospitalId, areaId: s.areaId, startTime: s.startTime, durationSeconds: s.durationSeconds },
           matched: r.matched,
           triggered: r.triggered,
+          matchedRule: r.matchedRule,
           eventLevel: r.result?.eventLevel,
           eventLevelText: r.result?.eventLevelText,
+          notificationTargets: r.result?.notificationTargets || [],
+          notificationTargetsText: r.result?.notificationTargetsText || [],
           threshold: r.threshold,
+          timeSlot: {
+            ...r.timeSlotMatch,
+            isNightTime,
+          },
           sensitivity: r.timeSlotMatch?.sensitivity,
-          strictModeApplied: r.strictModeImpact?.applied || false,
+          sensitivityText: r.timeSlotMatch?.sensitivityText,
+          strictModeImpact: r.strictModeImpact,
+          triggerReason: {
+            category: reasonCategory,
+            categoryText: this.triggerReasonText(reasonCategory),
+            isNightTime,
+            strictModeApplied: r.strictModeImpact?.applied || false,
+          },
           summary: r.result?.summary,
           error: null,
         });
       } catch (e: any) {
         results.push({
           index: i,
-          label: s.label || `场景${i + 1}`,
+          label,
           input: { hospitalId: s.hospitalId, areaId: s.areaId, startTime: s.startTime, durationSeconds: s.durationSeconds },
           matched: false,
           triggered: false,
+          matchedRule: null,
           eventLevel: null,
           eventLevelText: null,
+          notificationTargets: [],
+          notificationTargetsText: [],
           threshold: null,
+          timeSlot: null,
           sensitivity: null,
-          strictModeApplied: false,
+          sensitivityText: null,
+          strictModeImpact: { applied: false },
+          triggerReason: { category: 'error', categoryText: '计算异常' },
           summary: null,
           error: e.message || '计算失败',
         });
@@ -402,9 +457,39 @@ export class StayRuleService {
       triggered: triggeredCount,
       notTriggered: scenarios.length - triggeredCount,
       strictTriggered: strictTriggeredCount,
+      nightTimeScenarios: nightTimeCount,
       levelDistribution: levelCounts,
+      triggerReasonBreakdown: {
+        normal: triggerReasons.normal.count,
+        nightSensitivity: triggerReasons.nightSensitivity.count,
+        strictMode: triggerReasons.strictMode.count,
+        nightAndStrict: triggerReasons.nightAndStrict.count,
+      },
+      triggerReasonLabels: {
+        normal: triggerReasons.normal.labels,
+        nightSensitivity: triggerReasons.nightSensitivity.labels,
+        strictMode: triggerReasons.strictMode.labels,
+        nightAndStrict: triggerReasons.nightAndStrict.labels,
+      },
+      ruleHits: Object.values(ruleHits).sort((a, b) => b.count - a.count),
       results,
     };
+  }
+
+  private isNightTime(dt: Date): boolean {
+    const hour = dt.getHours();
+    return hour < 6 || hour >= 22;
+  }
+
+  private triggerReasonText(reason: string): string {
+    const map: Record<string, string> = {
+      normal: '正常时段触发',
+      nightSensitivity: '夜间灵敏度触发',
+      strictMode: '严控模式触发',
+      nightAndStrict: '夜间+严控双重影响',
+      error: '计算异常',
+    };
+    return map[reason] || reason;
   }
 
   private getSceneName(sceneType?: string): string {
